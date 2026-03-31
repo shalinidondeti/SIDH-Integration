@@ -3,6 +3,9 @@ import base64
 import json
 import time
 from Crypto.Cipher import AES
+from frappe import _
+from frappe.utils.oauth import redirect_post_login
+
 
 def unpad(byte_array):
     last_byte = byte_array[-1]
@@ -26,65 +29,80 @@ def validate_token_expiry(data):
     token_time = data.get("time_stamp")
     if not token_time:
         frappe.throw("Invalid token: missing timestamp")
-
-    current_time = int(time.time() * 1000)
-    if current_time - token_time > 30000:
+    if int(time.time() * 1000) - token_time > 30000:
         frappe.throw("Token expired")
 
 
 def validate_payload(data):
-    required_fields = ["candidate_id", "candidate_name", "course_id"]
-    for field in required_fields:
+    for field in ["candidate_id", "candidate_name", "course_id"]:
         if not data.get(field):
             frappe.throw(f"Invalid token: missing field '{field}'")
 
-    course_id = data.get("course_id")
-    if not frappe.db.exists("LMS Course", course_id):
-        frappe.throw(f"Course '{course_id}' does not exist")
+    if not frappe.db.exists("LMS Course", data.get("course_id")):
+        frappe.throw(f"Course '{data.get('course_id')}' does not exist")
 
     email = data.get("candidate_email")
     if email and "@" not in email:
         frappe.throw("Invalid token: malformed email address")
 
 
-def get_or_create_user(data):
-    candidate_id   = data.get("candidate_id")
-    candidate_name = data.get("candidate_name", "").strip()
-    last_name      = data.get("last_name", "").strip()
-    email = (
+def get_email(data):
+    return (
         data.get("candidate_email")
-        or f"{candidate_id}@sidh.in"
+        or f"{data.get('candidate_id')}@sidh.in"
     )
 
+def get_user_record(data: dict):
+    email = get_email(data)
+
     if frappe.db.exists("User", email):
-        return email
+        return frappe.get_doc("User", email)       
 
-    try:
-        user = frappe.get_doc({
-            "doctype"    : "User",
-            "email"      : email,
-            "first_name" : candidate_name,
-            "last_name"  : last_name,
-            "enabled"    : 1,
-            "user_type"  : "Website User"
-        })
-        user.insert(ignore_permissions=True)
-        frappe.db.commit()
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "SIDH SSO User Creation Failed")
-        frappe.throw("User creation failed")
+    user = frappe.new_doc("User")
+    user.update({
+        "doctype"      : "User",
+        "first_name"   : data.get("candidate_name", "").strip(),
+        "last_name"    : data.get("last_name", "").strip(),
+        "email"        : email,
+        "enabled"      : 1,
+        "new_password" : frappe.generate_hash(),   
+        "user_type"    : "Website User",
+    })
+    return user                                 
 
-    return email
+def update_sidh_user(data: dict):
+    user = get_user_record(data)          
+    update_user_record = user.is_new()
+
+    if not user.enabled:
+        frappe.respond_as_web_page(
+            _("Not Allowed"),
+            _("User {0} is disabled").format(user.email)
+        )
+        return False
+
+    if not user.get_social_login_userid("sidh"):   
+        update_user_record = True
+        user.set_social_login_userid(            
+            "sidh",
+            userid=str(data.get("candidate_id"))   
+        )
+
+    if update_user_record:
+        user.flags.ignore_permissions = True
+        user.flags.no_welcome_mail    = True      
+
+        if default_role := frappe.db.get_single_value("Portal Settings", "default_role"):
+            user.add_roles(default_role)          
+
+        user.save()
+
+    return user.email
 
 
 def enroll_user_in_course(email, course_id):
-    """Enroll the user in the given course if not already enrolled."""
-    if frappe.db.exists("LMS Enrollment", {
-        "course" : course_id,
-        "member" : email
-    }):
+    if frappe.db.exists("LMS Enrollment", {"course": course_id, "member": email}):
         return
-
     try:
         enrollment = frappe.get_doc({
             "doctype"     : "LMS Enrollment",
@@ -103,23 +121,26 @@ def enroll_user_in_course(email, course_id):
 def handle_sidh_sso():
     settings   = frappe.get_single("SIDH Settings")
     crypto_key = settings.get_password(fieldname="crypto_key", raise_exception=False)
-    crypto_iv  = settings.get_password(fieldname="crypto_iv", raise_exception=False)
+    crypto_iv  = settings.get_password(fieldname="crypto_iv",  raise_exception=False)
 
     token = frappe.request.args.get("token")
     if not token:
+        frappe.log_error("No token provided in SIDH SSO request", "SIDH SSO - Missing Token")
         frappe.throw("No token provided")
 
     data = decrypt_token(token, crypto_key, crypto_iv)
-
     validate_token_expiry(data)
     validate_payload(data)
 
-    email     = get_or_create_user(data)
+    if update_sidh_user(data) is False:
+        return
+    email = get_email(data)                                    
+
     course_id = data.get("course_id")
 
     frappe.local.login_manager.login_as(email)
+    frappe.db.commit()                             
 
     enroll_user_in_course(email, course_id)
 
-    frappe.local.response["type"]     = "redirect"
-    frappe.local.response["location"] = f"/lms/courses/{course_id}"
+    redirect_post_login(desk_user=False,redirect_to=f"/lms/courses/{course_id}")
